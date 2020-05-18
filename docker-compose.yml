@@ -35,8 +35,8 @@ services:
     # "ports" are ignored because of "network_mode: host". Either use "ports"
     # or "network_mode: host".
     #ports:
-    #  - "8080:8080"
-    #  - "4443:4443"
+      #- "9006:8080"
+      #- "9007:4443"
     environment:
       - "TZ=America/New_York"
     volumes:
@@ -52,14 +52,13 @@ services:
     #  - /dev/ttyACM0:/dev/ttyACM0
     # If Bluetooth, the container needs to run in privileged mode.
     #privileged: true
-    
+
   nzbget:
     image: "linuxserver/nzbget"
     container_name: "nzbget"
     volumes:
       - ${USERDIR}/docker/nzbget:/config
-      - ${USERDIR}/Downloads:/downloads
-      - ${USERDIR}/Downloads/incomplete:/incomplete-downloads
+      - ${USERDIR}/downloads:/downloads
       - ${USERDIR}/docker/shared:/shared
     ports:
       - "9001:6789"
@@ -74,8 +73,8 @@ services:
     container_name: "sonarr"
     volumes:
       - ${USERDIR}/docker/sonarr:/config
-      - ${USERDIR}/Downloads/completed:/downloads
-      - ${USERDIR}/media/tvshows:/tv
+      - ${USERDIR}/downloads/completed:/downloads
+      - ${USERDIR}/downloads/completed/Series:/tv
       - "/etc/localtime:/etc/localtime:ro"
       - ${USERDIR}/docker/shared:/shared
     ports:
@@ -91,8 +90,8 @@ services:
     container_name: "radarr"
     volumes:
       - ${USERDIR}/docker/radarr:/config
-      - ${USERDIR}/Downloads/completed:/downloads
-      - ${USERDIR}/media/movies:/movies
+      - ${USERDIR}/downloads/completed:/downloads
+      - ${USERDIR}/downloads/completed/Movies:/movies
       - "/etc/localtime:/etc/localtime:ro"
       - ${USERDIR}/docker/shared:/shared
     ports:
@@ -109,8 +108,8 @@ services:
     image: plexinc/pms-docker
     volumes:
       - ${USERDIR}/docker/plexms:/config
-      - ${USERDIR}/Downloads/plex_tmp:/transcode
-      - /media/media:/media
+      - /tmp:/transcode
+      - ${USERDIR}/downloads/completed:/data
       - ${USERDIR}/docker/shared:/shared
     ports:
       - "32400:32400/tcp"
@@ -125,7 +124,7 @@ services:
     environment:
       - TZ=${TZ}
       - HOSTNAME="Docker Plex"
-      - PLEX_CLAIM="claim-claim-asGKrr4g9-sNwKmKXhME"
+      - PLEX_CLAIM="claim-yBPds7QbLZk1U7XEuHMW"
       - PLEX_UID=${PUID}
       - PLEX_GID=${PGID}
       - ADVERTISE_IP="http://192.168.1.100:32400/"
@@ -135,7 +134,7 @@ services:
     container_name: "hydra"
     volumes:
       - ${USERDIR}/docker/hydra:/config
-      - ${USERDIR}/Downloads:/downloads
+      - ${USERDIR}/downloads:/downloads
       - ${USERDIR}/docker/shared:/shared
     ports:
       - "9004:5075"
@@ -144,3 +143,28 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ} 
+
+  nextcloud:
+    container_name: nextcloud
+    restart: always
+    image: linuxserver/nextcloud
+    volumes:
+      - ${USERDIR}/docker/nextcloud:/config
+      - ${USERDIR}/shared_data:/data
+      - ${USERDIR}/docker/shared:/shared
+    ports:
+      - "9005:443"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+
+  bind:
+    container_name: bind
+    restart: always
+    image: sameersbn/bind
+    ports:
+    - "53:53/udp"
+    - "53:53/tcp"
+    - "10000:10000/tcp"
+    volumes:
+    - /srv/docker/bind:/data
