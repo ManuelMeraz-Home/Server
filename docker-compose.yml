@@ -69,11 +69,11 @@ services:
     image: "linuxserver/radarr"
     container_name: "radarr"
     volumes:
-      - /tmp/external1/config/radarr:/config
+      - /mnt/external1/config/radarr:/config
       - /mnt/external1/downloads/completed:/downloads
       - /mnt/external1/downloads/completed/Movies:/movies
       - "/etc/localtime:/etc/localtime:ro"
-      - /tmp/external1/shared:/shared
+      - /mnt/external1/shared:/shared
     ports:
       - "9003:7878"
     restart: always
@@ -87,10 +87,10 @@ services:
     restart: always
     image: plexinc/pms-docker
     volumes:
-      - /tmp/external1/config/plexms:/config
+      - /mnt/external1/config/plexms:/config
       - /tmp:/transcode
       - /mnt/external1/downloads/completed:/data
-      - /tmp/external1/shared:/shared
+      - /mnt/external1/shared:/shared
     ports:
       - "32400:32400/tcp"
       - "3005:3005/tcp"
