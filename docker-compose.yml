@@ -13,53 +13,33 @@ services:
       - ${USERDIR}/docker/shared:/shared
     environment:
       - TZ=${TZ}
+
   organizr:
     container_name: organizr
+    hostname: organizr
+    image: organizr/organizr
     restart: always
-    image: lsiocommunity/organizr
+    ports:
+        - 80:80
+    volumes:
+        - /home/organizr:/config
     volumes:
       - ${USERDIR}/docker/organizr:/config
       - ${USERDIR}/docker/shared:/shared
-    ports:
-      - "80:80"
     environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-
-  webthings-gateway:
-    container_name: webthings-gateway
-    image: mozillaiot/gateway:latest
-    restart: unless-stopped
-    network_mode: host
-    # "ports" are ignored because of "network_mode: host". Either use "ports"
-    # or "network_mode: host".
-    #ports:
-      #- "9006:8080"
-      #- "9007:4443"
-    environment:
-      - "TZ=America/New_York"
-    volumes:
-      - /opt/docker/webthings-gateway:/home/node/.mozilla-iot
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "10"
-    # If certain devices are needed, e.g. USB dongles, enable them here.
-    #devices:
-    #  - /dev/ttyUSB0:/dev/ttyUSB0
-    #  - /dev/ttyACM0:/dev/ttyACM0
-    # If Bluetooth, the container needs to run in privileged mode.
-    #privileged: true
+        - fpm=true #true or false | using true will provide better performance
+        - branch=v2-master #v2-master or #v2-develop
+        - PUID=1000
+        - PGID=1000
+        - TZ=${TZ}
 
   nzbget:
     image: "linuxserver/nzbget"
     container_name: "nzbget"
     volumes:
-      - ${USERDIR}/docker/nzbget:/config
-      - ${USERDIR}/downloads:/downloads
-      - ${USERDIR}/docker/shared:/shared
+      - /mnt/external1/config/nzbget:/config
+      - /mnt/external1/downloads:/downloads
+      - /mnt/external1/shared:/shared
     ports:
       - "9001:6789"
     restart: always
@@ -72,11 +52,11 @@ services:
     image: "linuxserver/sonarr"
     container_name: "sonarr"
     volumes:
-      - ${USERDIR}/docker/sonarr:/config
-      - ${USERDIR}/downloads/completed:/downloads
-      - ${USERDIR}/downloads/completed/Series:/tv
+      - /mnt/external1/config/sonarr:/config
+      - /mnt/external1//downloads/completed:/downloads
+      - /mnt/external1/downloads/completed/Series:/tv
       - "/etc/localtime:/etc/localtime:ro"
-      - ${USERDIR}/docker/shared:/shared
+      - /mnt/external1/shared:/shared
     ports:
         - "9002:8989"
     restart: always
@@ -89,11 +69,11 @@ services:
     image: "linuxserver/radarr"
     container_name: "radarr"
     volumes:
-      - ${USERDIR}/docker/radarr:/config
-      - ${USERDIR}/downloads/completed:/downloads
-      - ${USERDIR}/downloads/completed/Movies:/movies
+      - /tmp/external1/config/radarr:/config
+      - /mnt/external1/downloads/completed:/downloads
+      - /mnt/external1/downloads/completed/Movies:/movies
       - "/etc/localtime:/etc/localtime:ro"
-      - ${USERDIR}/docker/shared:/shared
+      - /tmp/external1/shared:/shared
     ports:
       - "9003:7878"
     restart: always
@@ -107,10 +87,10 @@ services:
     restart: always
     image: plexinc/pms-docker
     volumes:
-      - ${USERDIR}/docker/plexms:/config
+      - /tmp/external1/config/plexms:/config
       - /tmp:/transcode
-      - ${USERDIR}/downloads/completed:/data
-      - ${USERDIR}/docker/shared:/shared
+      - /mnt/external1/downloads/completed:/data
+      - /tmp/external1/shared:/shared
     ports:
       - "32400:32400/tcp"
       - "3005:3005/tcp"
@@ -174,3 +154,77 @@ services:
 # also for ssl/tls:
 #      ADDED_FLAGS: "--tls=2"
     restart: always
+
+  nextcloud:
+    container_name: nextcloud
+    restart: always
+    image: linuxserver/nextcloud
+    volumes:
+      - /mnt/external1/config/nextcloud:/config
+      - /mnt/external1/shared_data:/data
+      - /mnt/external1/shared:/shared
+    ports:
+      - "9005:443"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+
+  phpmyadmin:
+    hostname: phpmyadmin
+    container_name: phpmyadmin
+    image: phpmyadmin/phpmyadmin
+    restart: always
+    links:
+      - mariadb:db
+    ports:
+      - 9006:80
+    environment:
+      - PMA_HOST=mariadb
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+
+  # to check ip: docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mariadbtest
+  # source: https://mariadb.com/kb/en/installing-and-using-mariadb-via-docker/
+  mariadb:
+    image: "linuxserver/mariadb"
+    container_name: "mariadb"
+    hostname: mariadb
+    volumes:
+        - /mnt/external1/config/mariadb:/config
+    ports:
+      - target: 3306
+        published: 3306
+        protocol: tcp
+        mode: host
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+
+  qbittorrent:
+    image: "linuxserver/qbittorrent"
+    container_name: "qbittorrent"
+    volumes:
+      - /mnt/external1/config/qbittorrent:/config
+      - /mnt/external1/downloads/completed:/downloads
+      - /mnt/external1/shared:/shared
+    ports:
+      - "9007:9007"
+      - "6881:6881"
+      - "6881:6881/udp"
+    restart: always
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK_SET=002
+      - WEBUI_PORT=9007
+
+  watchtower:
+    container_name: watchtower
+    restart: always
+    image: v2tec/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --schedule "0 0 4 * * *" --cleanup
