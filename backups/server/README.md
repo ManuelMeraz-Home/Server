@@ -34,15 +34,21 @@ runs; command failures and Borg warnings cause nonzero exits. After mount
 validation, Borg relocation acceptance is scoped to the expected pinned alias
 of the same repository. This avoids an interactive prompt for the fd path.
 
-**The server flock does not lock laptop Borg repositories.** This script copies
-the whole source tree, so repository writers must remain quiescent throughout
-copying. Ordinary rsync against a live Borg repository is not a consistent backup.
-Before scheduling, arrange an enforced quiet window or add a reviewed per-repository
-`borg with-lock` copy procedure. `with-lock` does not require decryption keys,
-but does update repository bookkeeping and copies lock files. Do not break locks
-on source repositories; copied stale locks require deliberate handling on restore.
-An interrupted copy must not be assumed usable. Never write independently to both
-copies of the same encrypted Borg repository.
+Top-level directories containing `config` and `data/` are excluded from the
+ordinary rsync pass and copied separately under native `borg with-lock` exclusive
+locks. Source `lock.exclusive` and `lock.roster` files are excluded. Lock acquisition
+waits up to 60 seconds; lock or copy failure fails the backup. Native locking needs
+no laptop decryption key, but updates source repository bookkeeping. Client jobs
+may wait or fail while a copy holds the lock; initial checksum comparison can take
+hours. Prefer an off-hours window.
+
+The current layout places all repositories directly under `/data`. Do not create
+new repositories during copying. Nested repositories need an explicit copying
+policy before scheduling; they are not discovered automatically. The bounded
+layout inspection and copy policy must be revisited when adding laptop repositories.
+Do not break source locks or run Borg writes independently on both encrypted copies.
+Existing stale destination locks are not removed automatically. An interrupted
+repository copy must not be assumed usable. No destination-only files are deleted.
 
 Before the first production run: review a checksum dry run, approve any genuine
 content replacements, reconcile old timestamp differences using checksum-based

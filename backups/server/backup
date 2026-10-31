@@ -31,6 +31,29 @@ run_operation() {
         exit "$rc"
     fi
 }
+# Existing repositories live directly below /data. New nested repositories
+# must be added to this copying policy before unattended backups resume.
+copy_secondary() {
+    local source_root=$1 target_root=$2 path name
+    shift 2
+    local -a repositories=() exclusions=()
+    for path in "$source_root"/*; do
+        [[ -d $path && ! -L $path && -f $path/config && -d $path/data ]] || continue
+        name=${path##*/}
+        [[ $name =~ ^[A-Za-z0-9_.-]+$ ]] || fail "unsupported repository directory name: $name"
+        [[ ! -L $target_root/$name ]] || fail "repository destination is a symlink: $name"
+        repositories+=("$name")
+        exclusions+=("--exclude=/$name/")
+    done
+    # A top-level repository is copied only in its native exclusive lock below.
+    run_operation 'rsync ordinary files' rsync -rltvh --stats "$@" "${exclusions[@]}" -- "$source_root/" "$target_root/"
+    for name in "${repositories[@]}"; do
+        # with-lock needs no decryption key; it does update Borg bookkeeping.
+        # Parent /proc/PID/fd paths remain valid when Borg closes child fds.
+        run_operation "locked repository copy: $name" borg with-lock --lock-wait 60 "$source_root/$name" \
+            rsync -rltvh --stats "$@" --exclude=/lock.exclusive --exclude=/lock.roster -- "$source_root/$name/" "$target_root/$name/"
+    done
+}
 main() {
     case "$*" in
         '--check-mounts') validate_mounts; printf 'backup: mount validation passed\n'; return ;;
@@ -58,7 +81,7 @@ main() {
     run_operation 'Borg create' borg create --stats '/proc/self/fd/7/server::system-{utcnow:%Y-%m-%dT%H-%M-%S}-{pid}' /etc /usr/local /var
     # Pruning intentionally disabled pending creation and restore verification.
     validate_mounts
-    run_operation 'rsync secondary copy' rsync -rltvh --stats -- /proc/self/fd/7/ /proc/self/fd/8/
+    copy_secondary "/proc/$BASHPID/fd/7" "/proc/$BASHPID/fd/8"
     printf 'backup: all operations completed successfully\n'
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
