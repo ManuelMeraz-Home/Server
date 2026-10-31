@@ -1,0 +1,64 @@
+#!/bin/bash
+set -Eeuo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+fail() { printf 'backup: ERROR: %s\n' "$*" >&2; exit 1; }
+trap 'rc=$?; printf "backup: ERROR: line %s exited %s\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+validate_mount() {
+    local path=$1 expected_uuid=$2 expected_type=$3 target uuid type fsroot options
+    target=$(findmnt -rn --mountpoint "$path" -o TARGET) || fail "$path is not mounted"
+    uuid=$(findmnt -rn --mountpoint "$path" -o UUID) || fail "cannot identify $path UUID"
+    type=$(findmnt -rn --mountpoint "$path" -o FSTYPE) || fail "cannot identify $path filesystem"
+    fsroot=$(findmnt -rn --mountpoint "$path" -o FSROOT) || fail "cannot identify $path filesystem root"
+    options=$(findmnt -rn --mountpoint "$path" -o OPTIONS) || fail "cannot identify $path options"
+    [[ $target == "$path" && $uuid == "$expected_uuid" && $type == "$expected_type" && $fsroot == / ]] || fail "unexpected filesystem at $path (target=$target UUID=$uuid type=$type root=$fsroot)"
+    [[ ,$options, == *,rw,* ]] || fail "$path is read-only"
+}
+validate_mounts() {
+    validate_mount /data cb62672f-3ff5-471b-a5ac-207eacaa643e ext4
+    validate_mount /data_sync 54BC8BB0BC8B8AE6 fuseblk
+    [[ -d /data/server && ! -L /data/server && -f /data/server/config ]] || fail 'Borg repository missing or symlinked'
+}
+run_operation() {
+    local label=$1 rc
+    shift
+    printf 'backup: starting %s\n' "$label"
+    if "$@"; then
+        printf 'backup: completed %s\n' "$label"
+    else
+        rc=$?
+        printf 'backup: ERROR: %s failed (exit %s)\n' "$label" "$rc" >&2
+        exit "$rc"
+    fi
+}
+main() {
+    case "$*" in
+        '--check-mounts') validate_mounts; printf 'backup: mount validation passed\n'; return ;;
+        '/data /data_sync') ;;
+        *) fail 'usage: backup /data /data_sync | backup --check-mounts' ;;
+    esac
+    [[ $EUID == 0 ]] || fail 'production backup must run as root'
+    exec 9>/run/lock/mandm-backup.lock
+    flock -n 9 || fail 'another backup is already running'
+    validate_mounts
+    # Hold working directories on both filesystems. Normal unmounts are busy;
+    # subsequent relative operations cannot fall through to root after a lazy unmount.
+    cd /data_sync
+    exec 8<.
+    cd /data
+    exec 7<.
+    validate_mounts
+    # Repositories and rsync paths use pinned filesystem descriptors.
+    export BORG_PASSCOMMAND='/usr/bin/cat /etc/backup/borg-passphrase'
+    unset BORG_PASSPHRASE BORG_PASSPHRASE_FD
+    # The guarded pinned path aliases /data/server; accept that expected alias.
+    export BORG_RELOCATED_REPO_ACCESS_IS_OK=yes
+    export TMPDIR=/var/tmp
+    run_operation 'temporary storage preflight' /usr/bin/python3 -c 'import tempfile; f=tempfile.TemporaryFile(); f.write(b"backup preflight"); f.flush(); f.close()'
+    run_operation 'Borg create' borg create --stats '/proc/self/fd/7/server::system-{utcnow:%Y-%m-%dT%H-%M-%S}-{pid}' /etc /usr/local /var
+    # Pruning intentionally disabled pending creation and restore verification.
+    validate_mounts
+    run_operation 'rsync secondary copy' rsync -rltvh --stats -- /proc/self/fd/7/ /proc/self/fd/8/
+    printf 'backup: all operations completed successfully\n'
+}
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

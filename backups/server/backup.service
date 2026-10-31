@@ -1,0 +1,16 @@
+[Unit]
+Description=Create redundant backup of /data
+RequiresMountsFor=/data /data_sync
+BindsTo=data.mount data_sync.mount
+After=data.mount data_sync.mount
+AssertPathIsMountPoint=/data
+AssertPathIsMountPoint=/data_sync
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=TMPDIR=/var/tmp
+ExecStartPre=/usr/local/bin/backup --check-mounts
+ExecStart=/usr/local/bin/backup /data /data_sync
