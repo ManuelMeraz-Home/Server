@@ -31,28 +31,15 @@ run_operation() {
         exit "$rc"
     fi
 }
-# Existing repositories live directly below /data. New nested repositories
-# must be added to this copying policy before unattended backups resume.
 copy_secondary() {
-    local source_root=$1 target_root=$2 path name
+    local source_root=$1 target_root=$2
     shift 2
-    local -a repositories=() exclusions=()
-    for path in "$source_root"/*; do
-        [[ -d $path && ! -L $path && -f $path/config && -d $path/data ]] || continue
-        name=${path##*/}
-        [[ $name =~ ^[A-Za-z0-9_.-]+$ ]] || fail "unsupported repository directory name: $name"
-        [[ ! -L $target_root/$name ]] || fail "repository destination is a symlink: $name"
-        repositories+=("$name")
-        exclusions+=("--exclude=/$name/")
-    done
-    # A top-level repository is copied only in its native exclusive lock below.
-    run_operation 'rsync ordinary files' rsync -rltvh --stats "$@" "${exclusions[@]}" -- "$source_root/" "$target_root/"
-    for name in "${repositories[@]}"; do
-        # with-lock needs no decryption key; it does update Borg bookkeeping.
-        # Parent /proc/PID/fd paths remain valid when Borg closes child fds.
-        run_operation "locked repository copy: $name" borg with-lock --lock-wait 60 "$source_root/$name" \
-            rsync -rltvh --stats "$@" --exclude=/lock.exclusive --exclude=/lock.roster -- "$source_root/$name/" "$target_root/$name/"
-    done
+    if (( $# )); then
+        [[ " $* " == *" --dry-run "* ]] || fail 'unexpected secondary-copy arguments'
+        run_operation 'secondary checksum review' /usr/bin/python3 /usr/local/libexec/backup-secondary review "$source_root" "$target_root"
+    else
+        run_operation 'staged secondary copy' /usr/bin/python3 /usr/local/libexec/backup-secondary normal "$source_root" "$target_root"
+    fi
 }
 main() {
     case "$*" in

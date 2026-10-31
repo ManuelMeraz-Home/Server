@@ -1,61 +1,75 @@
 # Server backups
 
-Bash, Borg 1.2, rsync, and systemd configuration for `/data` -> `/data_sync`.
-Borg stores `/etc`, `/usr/local`, and `/var` in `/data/server`. Automatic pruning
-is disabled. Rsync preserves modification times and symbolic links without
-preserving POSIX ownership/permissions or deleting destination-only files.
+Bash, Python 3, Borg 1.2 and rsync copy `/data` to `/data_sync`.
+Borg stores `/etc`, `/usr/local` and `/var` in `/data/server`. Archive pruning
+is disabled. Ordinary files preserve times/symlinks; destination-only ordinary
+files are retained. NTFS ownership/permissions are not a POSIX replica.
 
-## Installation
+## Install
 
-Review the expected mount UUIDs and filesystem types in `backup` for the target
-machine. These are storage identities, not encryption credentials. NTFS currently
-reports `fuseblk`; a driver change requires updating validation deliberately.
-Back up installed configuration securely before replacing it.
+Review the mount UUIDs/types in `backup`. Install it root:root 0755 as
+`/usr/local/bin/backup`; install `backup-secondary` root:root 0755 as
+`/usr/local/libexec/backup-secondary`. Install units root:root 0644 under
+`/etc/systemd/system/`. Preserve restricted originals before replacing anything.
 
-Install `backup` as root:root mode 0755 at `/usr/local/bin/backup` and the units
-as root:root mode 0644 in `/etc/systemd/system/`. Store the existing Borg
-passphrase in `/etc/backup/borg-passphrase` (root:root 0600), inside a root-owned
-0700 `/etc/backup` directory. Never add this file, encryption keys, archive
-listings, backup data, or private operational reports to Git. Keep an independent
-secure recovery copy of the repository encryption key and passphrase.
+Keep the existing passphrase in `/etc/backup/borg-passphrase` (root:root 0600),
+inside root-owned 0700 `/etc/backup`. State belongs in `/etc/backup/state`
+(root-only 0700, files 0600). Never commit credentials, state, archive listings,
+backup data or private operational reports. Keep recovery credentials separately.
 
-Run `bash -n /usr/local/bin/backup`, `backup --check-mounts`,
-`systemd-analyze verify /etc/systemd/system/backup.{service,timer}`, and
-`systemctl daemon-reload` as appropriate. The service is static and is started
-by the timer. Leave the timer disabled/stopped during validation.
+Check Bash/Python syntax, `backup --check-mounts`, and `systemd-analyze verify`
+on both units. Reload systemd after unit changes. Keep the timer stopped during
+validation; the service is static and must not be enabled independently.
 
-## Safety and activation prerequisites
+## Copy safety
 
-The script checks both exact mountpoints, UUIDs, filesystem types, filesystem
-roots, and writable mount options. systemd requires/binds both mount units and
-asserts mountpoints. Open directory descriptors keep copy paths on the intended
-filesystems even after a lazy unmount. A single flock prevents overlapping server
-runs; command failures and Borg warnings cause nonzero exits. After mount
-validation, Borg relocation acceptance is scoped to the expected pinned alias
-of the same repository. This avoids an interactive prompt for the fd path.
+Both exact mountpoints, UUIDs, filesystem types and writable mounts are checked.
+Pinned directory descriptors prevent writes falling through to root after unmount.
+The server flock serializes jobs; failures and Borg warnings return nonzero.
 
-Top-level directories containing `config` and `data/` are excluded from the
-ordinary rsync pass and copied separately under native `borg with-lock` exclusive
-locks. Source `lock.exclusive` and `lock.roster` files are excluded. Lock acquisition
-waits up to 60 seconds; lock or copy failure fails the backup. Native locking needs
-no laptop decryption key, but updates source repository bookkeeping. Client jobs
-may wait or fail while a copy holds the lock; initial checksum comparison can take
-hours. Prefer an off-hours window.
+All known repositories are directly below `/data`. Directories containing
+`config` and `data/` are excluded from ordinary rsync and copied under exclusive
+native `borg with-lock` locks, with a 60-second acquisition timeout. No client
+key is needed for locking, but source bookkeeping changes and clients may wait
+or fail on contention. Do not create repositories during a copy. Nested
+repositories need a separate reviewed policy before adding them.
 
-The current layout places all repositories directly under `/data`. Do not create
-new repositories during copying. Nested repositories need an explicit copying
-policy before scheduling; they are not discovered automatically. The bounded
-layout inspection and copy policy must be revisited when adding laptop repositories.
-Do not break source locks or run Borg writes independently on both encrypted copies.
-Existing stale destination locks are not removed automatically. An interrupted
-repository copy must not be assumed usable. No destination-only files are deleted.
+Each repository has fixed current, `.NAME.staging` and `.NAME.previous` slots.
+Stages copy current source metadata independently and hard-link only reusable
+segment files. Changed data uses rsync temporary-file replacement, never in-place
+or append writes. Obsolete files are omitted from fresh stages; deletion is
+limited to staging/data. Current and previous contents remain protected during
+staging. Shared segment timestamps may change; contents must not.
 
-Before the first production run: review a checksum dry run, approve any genuine
-content replacements, reconcile old timestamp differences using checksum-based
-copying, and validate a real configuration backup and selected restores. A tiny
-synthetic restore alone does not validate the full system or laptop recoverability.
-Confirm time synchronization and enough space on both filesystems and root.
+Normal runs use timestamp/size checks for historical segments and checksums for
+the server repository. Metadata is checksummed; index integrity, committed
+transaction and segment references are checked. The server receives a full
+repository-only check and selected authenticated restores before/after promotion.
+Historical same-size payload corruption is not exhaustively checked. Do not run
+Borg writes/maintenance independently on either secondary generation.
 
-The timer runs daily at 02:00 America/New_York with persistent catch-up. Starting
-it may immediately launch a missed run. Only after explicit operational approval,
-enable/start `backup.timer`; do not enable the service independently.
+## One-previous retention (explicit authorization required)
+
+Without `/etc/backup/retire-previous-approved` (root-owned 0600), a retained
+previous generation blocks another rotation. The marker is operator authorization;
+installation alone must not create it. Only enable after explicit retention approval.
+
+With authorization: validate recorded current identity and the incoming stage,
+record durable cleanup/promotion intent, retire only the identified older previous,
+rename current to previous, then promote staging. One verified predecessor remains.
+Current remains intact during staging, validation and older-previous cleanup.
+Interrupted promotion is recovered from the root-only journal and directory identities.
+Unexpected identities or unresolved unverified stages fail closed. No numbered
+generations accumulate. Physical power-loss/controller behavior is not proven by
+process-interruption tests.
+
+`fast` is the one-time repair mode and requires private incident artifacts outside
+Git. It trusts same-size historical segments and never retires a previous generation.
+Use normal mode through `backup` for scheduled operation.
+
+## Schedule
+
+The timer is daily at 02:00 America/New_York with persistent catch-up; activation
+may immediately run a missed job. Require successful production backup/restore
+validation, approved retention, and explicit timer activation approval before
+starting it. Coordinate laptop schedules to avoid source-lock contention.

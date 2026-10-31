@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+"""Small staged secondary-copy helper. No archive maintenance or source deletion."""
+import os,sys,pathlib,subprocess,json,hashlib,shutil,tempfile,stat,configparser,time,fcntl
+STATE=pathlib.Path('/etc/backup/state')
+POLICY=pathlib.Path('/etc/backup/retire-previous-approved')
+SELECTED=['etc/hostname','etc/fstab','usr/local/bin/backup','usr/local/libexec/backup-secondary','etc/systemd/system/backup.service','etc/systemd/system/backup.timer']
+def fail(s):raise RuntimeError(s)
+def syncdir(p):
+ fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+def save(p,obj):
+ p.parent.mkdir(mode=0o700,parents=True,exist_ok=True);fd,tmp=tempfile.mkstemp(dir=p.parent)
+ with os.fdopen(fd,'w') as f:json.dump(obj,f,indent=2);f.flush();os.fsync(f.fileno())
+ os.replace(tmp,p);syncdir(p.parent)
+def sha(p):
+ h=hashlib.sha256()
+ with pathlib.Path(p).open('rb') as f:
+  while block:=f.read(1024*1024):h.update(block)
+ return h.hexdigest()
+def fingerprint(p):
+ s=pathlib.Path(p).stat();return dict(bytes=s.st_size,mtime_ns=s.st_mtime_ns,mode=stat.S_IMODE(s.st_mode),uid=s.st_uid,gid=s.st_gid,sha256=sha(p))
+def run(args,timeout=None,**kw):
+ print('Running:',args[0],args[1] if len(args)>1 else '',flush=True)
+ r=subprocess.run(args,stdin=subprocess.DEVNULL,timeout=timeout,**kw)
+ if r.returncode:fail('Operation failed, exit '+str(r.returncode))
+ return r
+
+def files(root):
+ result={}
+ for base,dirs,names in os.walk(root):
+  dirs[:]=[n for n in dirs if n!='lock.exclusive']
+  for n in dirs:
+   if (pathlib.Path(base)/n).is_symlink():fail('Symlink directory in repository')
+  for n in names:
+   if n=='lock.roster':continue
+   p=pathlib.Path(base)/n
+   if not stat.S_ISREG(p.lstat().st_mode):fail('Nonregular repository file')
+   result[str(p.relative_to(root))]=p.stat().st_size
+ return result
+
+def repoid(root):
+ c=configparser.ConfigParser();c.read(pathlib.Path(root)/'config');return c['repository']['id']
+def clone_current_segments(src,current,stage,budget=None):
+ if stage.exists() or stage.is_symlink():fail('Unresolved staging directory; stop')
+ if current.is_symlink() or repoid(src)!=repoid(current):fail('Repository identity/target mismatch')
+ if (current/'lock.exclusive').exists() or (current/'lock.roster').exists():fail('Destination repository is in use or has lock state')
+ a=files(src);old=files(current)
+ if any('/' in n and not n.startswith('data/') for n in a):fail('Unexpected repository layout')
+ needed=sum(size for name,size in a.items() if name.startswith('data/') and old.get(name)!=size)
+ if budget is not None and needed>budget:fail('New/different segment payload exceeds 10 GiB fast-run budget')
+ if shutil.disk_usage(current).free<needed+sum(n for p,n in a.items() if not p.startswith('data/'))+1024**3:fail('Insufficient staging headroom')
+ stage.mkdir()
+ for name,size in a.items():
+  target=stage/name;target.parent.mkdir(parents=True,exist_ok=True)
+  if name.startswith('data/'):
+   if old.get(name)==size:os.link(current/name,target)
+  else:shutil.copy2(src/name,target)  # Root metadata is NEVER hard-linked.
+ return dict(source_files=a,obsolete_count=len(old.keys()-a.keys()),new_segment_bytes=needed)
+
+LOG_SETUP=False
+def structural_check(repo):
+ global LOG_SETUP
+ if not LOG_SETUP:
+  from borg.logger import setup_logging
+  setup_logging();LOG_SETUP=True
+ from borg.repository import Repository
+ with Repository(str(repo),exclusive=False,lock=False) as r:
+  tx=r.get_index_transaction_id();committed=r.io.get_segments_transaction_id()
+  if tx is None or tx!=committed:fail('Index/commit mismatch; refuse automatic replay or repair')
+  from borg.hashindex import NSIndex
+  from borg.crypto.file_integrity import IntegrityCheckedFile
+  with IntegrityCheckedFile(str(pathlib.Path(repo)/('index.'+str(tx))),write=False,integrity_data=r._read_integrity(tx,b'index')) as fd:index=NSIndex.read(fd)
+  maximum={};count=0
+  for key,(segment,offset) in index.iteritems():maximum[segment]=max(maximum.get(segment,0),offset);count+=1
+  for segment,offset in maximum.items():
+   p=pathlib.Path(r.io.segment_filename(segment))
+   if not p.is_file() or p.stat().st_size<offset+r.io.header_fmt.size:fail('Referenced segment absent/truncated')
+ return dict(transaction=tx,index_objects=count,referenced_segments=len(maximum),scope='Index integrity and referenced segment existence/offsets; segment payloads not fully checked')
+
+def server_restore(repo,expected=None,archive=None):
+ base=pathlib.Path(tempfile.mkdtemp(prefix='secondary-server-restore-',dir='/var/tmp'));restore=base/'restore';restore.mkdir()
+ env=os.environ.copy();env.pop('BORG_PASSPHRASE',None);env.pop('BORG_PASSPHRASE_FD',None)
+ env.update(BORG_PASSCOMMAND='/usr/bin/cat /etc/backup/borg-passphrase',BORG_CACHE_DIR=str(base/'cache'),BORG_CONFIG_DIR=str(base/'config'),BORG_SECURITY_DIR=str(base/'security'),BORG_RELOCATED_REPO_ACCESS_IS_OK='yes')
+ p=run(['borg','list','--json',str(repo)],env=env,capture_output=True,text=True)
+ archives=json.loads(p.stdout)['archives'];real=[a for a in archives if a['name'].startswith(('system-','server-config-'))]
+ if not real:fail('No real configuration archive')
+ archive=archive or max(real,key=lambda a:a['time'])['name'];before=expected or {p:fingerprint('/'+p) for p in SELECTED}
+ run(['borg','extract',str(repo)+'::'+archive]+SELECTED,cwd=restore,env=env)
+ after=expected or {p:fingerprint('/'+p) for p in SELECTED};restored={p:fingerprint(restore/p) for p in SELECTED}
+ if before!=after or before!=restored:fail('Server restoration differs from stable current configuration')
+ return dict(archive=archive,restore_directory=str(restore),files_match=True,files=restored)
+
+def rotate(current,stage,previous,journal,approved,validation=None,checkpoint=lambda point:None):
+ def inode(p):
+  if p.is_symlink() or (p.exists() and not p.is_dir()):fail('Unexpected rotation slot type')
+  return p.stat().st_ino if p.exists() else None
+ if journal.exists():state=json.loads(journal.read_text())
+ else:
+  state=dict(phase='cleanup',current=inode(current),stage=inode(stage),previous=inode(previous),validation=validation);save(journal,state);checkpoint('after_journal')
+ if state['phase'] not in ['cleanup','promote']:fail('Unknown rotation state')
+ if state['phase']=='cleanup':
+  if inode(current)!=state['current'] or inode(stage)!=state['stage']:fail('Rotation slot changed')
+  if previous.exists():
+   if not approved:fail('Retiring previous generation is not approved')
+   if inode(previous)!=state['previous']:fail('Previous identity changed')
+   shutil.rmtree(previous);syncdir(previous.parent);checkpoint('after_cleanup')
+  state['phase']='promote';save(journal,state);checkpoint('after_intent')
+ if inode(current)==state['current']:
+  if previous.exists() or inode(stage)!=state['stage']:fail('Unexpected promotion slots')
+  os.rename(current,previous);syncdir(current.parent);checkpoint('after_current_rename')
+ if not current.exists():
+  if inode(previous)!=state['current'] or inode(stage)!=state['stage']:fail('Unexpected recovery slots')
+  os.rename(stage,current);syncdir(current.parent);checkpoint('after_stage_rename')
+ if inode(current)!=state['stage'] or inode(previous)!=state['current'] or stage.exists():fail('Promotion verification failed')
+ save(journal.with_name(journal.stem+'-last-success.json'),dict(validation=state.get('validation'),current_inode=inode(current),previous_inode=inode(previous)))
+ checkpoint('before_journal_remove');journal.unlink();syncdir(journal.parent)
+
+def copy_repo(srcroot,dstroot,name,mode,state=STATE,approved=False):
+ if not name or name in ['.','..'] or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-' for c in name):fail('Unsafe repository name')
+ if mode not in ['fast','normal','checksum']:fail('Invalid repository mode')
+ if mode=='fast':approved=False  # Initial reconciliation NEVER deletes a previous generation.
+ src=srcroot/name;current=dstroot/name;stage=dstroot/('.'+name+'.staging');previous=dstroot/('.'+name+'.previous');journal=state/(name+'.json')
+ if journal.exists():
+  rotate(current,stage,previous,journal,approved);print('Recovered prior promotion:',name,flush=True)
+ if previous.exists():
+  if not approved:fail('Previous generation exists; cleanup approval required')
+  recorded=json.loads((state/(name+'-last-success.json')).read_text())
+  if recorded['current_inode']!=current.stat().st_ino or recorded['previous_inode']!=previous.stat().st_ino or repoid(previous)!=repoid(src):fail('Generation identity differs from recorded verified rotation')
+  structural_check(current)
+ result=clone_current_segments(src,current,stage,budget=10*1024**3 if mode=='fast' else None)
+ flags=['rsync','-rltvh','--stats','--delete-delay']
+ if name=='server' or mode=='checksum':flags+=['--checksum','--checksum-choice=sha1']
+ elif mode=='fast':flags+=['--size-only']
+ run(flags+['--',str(src/'data')+'/',str(stage/'data')+'/'],timeout=600 if mode=='fast' else None)
+ # No full scans of historical payloads: verify metadata completely and structure separately.
+ for name2 in result['source_files']:
+  if not name2.startswith('data/'):
+   if (stage/name2).stat().st_nlink!=1 or sha(src/name2)!=sha(stage/name2):fail('Metadata isolation/checksum failed')
+ if files(stage)!=files(src):fail('Staging file set/size differs from locked source')
+ result['structure']=structural_check(stage)
+ if name=='server':
+  env=os.environ.copy();env['BORG_PASSCOMMAND']='/usr/bin/cat /etc/backup/borg-passphrase'
+  run(['borg','check','--repository-only',str(stage)],env=env,timeout=600 if mode=='fast' else None)
+  result['server_restore']=server_restore(stage)
+ result['source_file_count']=len(result.pop('source_files'));result['mode']=mode;result['name']=name
+ rotate(current,stage,previous,journal,approved,validation=result)
+ if name=='server':
+  expected=result['server_restore'];result['promoted_restore']=server_restore(current,expected=expected['files'],archive=expected['archive'])
+ save(state/(name+'-last-success.json'),dict(validation=result,current_inode=current.stat().st_ino,previous_inode=previous.stat().st_ino));print('Validated/promoted:',name,flush=True)
+
+def discover(src):return sorted(p.name for p in src.iterdir() if p.is_dir() and not p.is_symlink() and (p/'config').is_file() and (p/'data').is_dir())
+def policy_ok():return POLICY.is_file() and POLICY.stat().st_uid==0 and stat.S_IMODE(POLICY.stat().st_mode)==0o600
+
+def main():
+ if os.geteuid()!=0:fail('Root required')
+ os.umask(0o077)
+ mode=sys.argv[1];src=pathlib.Path(sys.argv[2]);dst=pathlib.Path(sys.argv[3])
+ subprocess.run(['/usr/local/bin/backup','--check-mounts'],check=True)
+ if src.stat().st_dev!=os.stat('/data').st_dev or dst.stat().st_dev!=os.stat('/data_sync').st_dev:fail('Pinned device mismatch')
+ if mode=='repo':
+  copy_repo(src,dst,sys.argv[4],sys.argv[5],approved=policy_ok());return
+ if mode not in ['normal','fast','review']:fail('Invalid copy mode')
+ names=discover(src);exclude=['--exclude=/'+n+'/' for n in names]
+ def repositories():
+  for name in names:
+   if mode=='review':cmd=flags+['--exclude=/lock.exclusive','--exclude=/lock.roster','--',str(src/name)+'/',str(dst/name)+'/']
+   else:cmd=['python3',os.path.realpath(__file__),'repo',str(src),str(dst),name,mode]
+   run(['borg','with-lock','--lock-wait','60',str(src/name)]+cmd)
+ if mode=='fast':
+  names.sort(key=lambda n:(n!='server',n));repositories()
+ if mode=='fast':
+  b=pathlib.Path('/home/manny/backup-repair');plan=json.loads((b/'ordinary-verified-metadata-plan.json').read_text());old={x['path']:x for x in map(json.loads,(b/'rsync-metadata.jsonl').open())}
+  for name in plan['eligible_paths']:
+   if pathlib.PurePosixPath(name).is_absolute() or '..' in pathlib.PurePosixPath(name).parts:fail('Unsafe ordinary metadata path')
+   a=(src/name).lstat();d=(dst/name).lstat();v=old[name]
+   if not stat.S_ISREG(a.st_mode) or not stat.S_ISREG(d.st_mode) or a.st_size!=d.st_size or a.st_size!=v['bytes'] or a.st_mtime!=v['source_mtime'] or d.st_mtime!=v['destination_mtime']:fail('Ordinary file changed since successful checksum review')
+  for name in plan['eligible_paths']:
+   a=(src/name).stat();d=(dst/name).stat();os.utime(dst/name,ns=(d.st_atime_ns,a.st_mtime_ns))
+  print('Normalized metadata only for',len(plan['eligible_paths']),'previously checksummed ordinary files',flush=True)
+  p=run(['rsync','-rltni','--out-format=%i|%l|%n']+exclude+['--',str(src)+'/',str(dst)+'/'],capture_output=True,text=True)
+  if any(l.startswith('>f') and '+++++++++' not in l[:11] for l in p.stdout.splitlines()):fail('Unexpected ordinary content transfer; review before proceeding')
+ flags=['rsync','-rltvh','--stats']
+ if mode=='review':flags+=['--checksum','--checksum-choice=sha1','--dry-run','--itemize-changes','--out-format=%i|%l|%n%L']
+ run(flags+exclude+['--',str(src)+'/',str(dst)+'/'])
+ if mode!='fast':repositories()
+if __name__=='__main__':
+ try:main()
+ except Exception as e:print('backup-secondary: ERROR:',type(e).__name__,str(e),file=sys.stderr);raise SystemExit(1)
